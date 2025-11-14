@@ -7,7 +7,13 @@ from csv import *
 from time import perf_counter  # Updated import
 from math import exp
 from numpy import *
-from pylab import *
+
+try:
+    from pylab import *  # type: ignore
+except ImportError:
+    # pylab/matplotlib not available in this environment.
+    # Plotting functions won't work, but the core economics still will.
+    pass
 from diseasefuncs import *
 
 
