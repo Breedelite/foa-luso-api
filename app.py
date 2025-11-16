@@ -57,14 +57,13 @@ class RotationInput(BaseModel):
     name_sequence: Optional[List[str]] = None
     label: Optional[str] = None  # optional user label for the rotation
 
+from typing import Any, Optional, Dict
+# (you may already have Optional imported; just make sure it's there)
 
 class EvaluateRequest(BaseModel):
-    """
-    Request body for /evaluate.
-    """
     rotation: RotationInput
-    # Future flags (for now deterministic only):
     annualise: bool = True
+    scenario: Optional[Dict[str, Any]] = None
 
 
 class RotationEconomics(BaseModel):
@@ -186,6 +185,92 @@ def names_from_indices(indices: List[int]) -> List[str]:
         names.append(LULIST[i]["name"])
     return names
 
+from copy import deepcopy
+
+
+def build_scenario_adjusted_inputs(
+    scenario: dict | None,
+) -> tuple[list[dict], dict]:
+    """
+    Take the global LULIST & PARAMETERS and return copies with
+    simple overrides applied from the 'scenario' block.
+
+    Rules (version 1):
+      - If scenario is None or empty: return originals unchanged.
+      - Wheat / Barley / Canola:
+          scenario["wheat"]["price_per_t"]
+          scenario["wheat"]["yield_t_ha"]
+        mapped straight onto lu['price'] and lu['yield'].
+      - N price:
+          scenario["N_price_per_kgN"] -> PARAMETERS["Ncost"]
+      - Pasture:
+          scenario["pasture"] contains lamb + wool production.
+          We convert this to a single gross revenue per ha
+          and set yield=1.0, price=revenue for all *pasture* LUs
+          (vpasture, ipasture, npasture).
+    """
+    # If nothing to do, just hand back the originals
+    if not scenario:
+        return LULIST, PARAMETERS  # type: ignore[return-value]
+
+    # Work on copies so the globals stay as the default bundle
+    assert LULIST is not None and PARAMETERS is not None
+    lulist = deepcopy(LULIST)
+    params = dict(PARAMETERS)
+
+    # --- 1) N price override -----------------------------------
+    n_price = scenario.get("N_price_per_kgN")
+    if isinstance(n_price, (int, float)):
+        try:
+            params["Ncost"] = float(n_price)
+        except Exception:
+            pass  # if the key isn't there, just ignore
+
+    # helper to apply grain overrides
+    def apply_grain_override(lu_name: str, scenario_key: str) -> None:
+        block = scenario.get(scenario_key)
+        if not isinstance(block, dict):
+            return
+
+        price = block.get("price_per_t")
+        yld = block.get("yield_t_ha")
+        if price is None or yld is None:
+            return
+
+        for lu in lulist:
+            if lu.get("name") == lu_name:
+                lu["price"] = float(price)
+                lu["yield"] = float(yld)
+
+    # --- 2) Crops: wheat, barley, canola -----------------------
+    apply_grain_override("wheat", "wheat")
+    apply_grain_override("barley", "barley")
+    apply_grain_override("canola", "canola")
+
+    # --- 3) Pasture revenue: lamb + wool -----------------------
+    past = scenario.get("pasture")
+    if isinstance(past, dict):
+        lamb_kg = past.get("lamb_kg_cwt_ha") or 0
+        lamb_price = past.get("lamb_price_per_kg") or 0
+        wool_kg = past.get("wool_cfw_kg_ha") or 0
+        wool_price = past.get("wool_price_per_kg") or 0
+
+        try:
+            revenue = (
+                float(lamb_kg) * float(lamb_price)
+                + float(wool_kg) * float(wool_price)
+            )
+        except Exception:
+            revenue = 0.0
+
+        if revenue > 0:
+            for lu in lulist:
+                if lu.get("name") in ("vpasture", "ipasture", "npasture"):
+                    # force "1 * revenue" so profit per ha ≈ revenue - costs
+                    lu["yield"] = 1.0
+                    lu["price"] = float(revenue)
+
+    return lulist, params
 
 # --------------------------------------------------------------------
 # 5. Endpoints
@@ -218,25 +303,9 @@ def root() -> dict:
 def evaluate_rotation(req: EvaluateRequest) -> EvaluateResponse:
     """
     Deterministic evaluation of a single rotation using the default season.
-    This mirrors the behaviour of 'single rotation with default season.py'.
 
-    Body example:
-
-    {
-      "rotation": {
-        "index_sequence": [6,0,0,1,0,0],
-        "label": "nugpasture-wheat-wheat-canola-wheat-wheat"
-      },
-      "annualise": true
-    }
-
-    or
-
-    {
-      "rotation": {
-        "name_sequence": ["nugpasture","wheat","wheat","canola","wheat","wheat"]
-      }
-    }
+    Now with optional 'scenario' overrides for prices, yields, N price,
+    and pasture revenue.
     """
     ensure_loaded()
     assert LULIST is not None and PARAMETERS is not None and OPTIONALPARAMS is not None
@@ -244,32 +313,35 @@ def evaluate_rotation(req: EvaluateRequest) -> EvaluateResponse:
     indices = indices_from_rotation(req.rotation)
     names = names_from_indices(indices)
 
-    # Use the original profit() just like
-    #  "single rotation with default season.py" does.
-    #
-    # In that script they do:
-    #     prof = profit(cropRotation, parameters, lulist, annualise=True)
-    #
-    # So here we do the same, and compute total-from-annual and vice versa.
+    # NEW: build adjusted inputs if a scenario was supplied
+    scenario_data: dict | None = getattr(req, "scenario", None)
+    lulist_use, params_use = build_scenario_adjusted_inputs(scenario_data)
+
+    # Use adjusted LUs + parameters when calling original LUSO profit()
     if req.annualise:
-        profit_per_year = profit(indices, PARAMETERS, LULIST,
-                                 getDetails=False,
-                                 optionalparams=OPTIONALPARAMS,
-                                 annualise=True)
+        profit_per_year = profit(
+            indices,
+            params_use,
+            lulist_use,
+            getDetails=False,
+            optionalparams=OPTIONALPARAMS,
+            annualise=True,
+        )
         years = len(indices)
         profit_total = profit_per_year * years
     else:
-        profit_total = profit(indices, PARAMETERS, LULIST,
-                              getDetails=False,
-                              optionalparams=OPTIONALPARAMS,
-                              annualise=False)
+        profit_total = profit(
+            indices,
+            params_use,
+            lulist_use,
+            getDetails=False,
+            optionalparams=OPTIONALPARAMS,
+            annualise=False,
+        )
         years = len(indices)
         profit_per_year = profit_total / years
 
-    label = (
-        req.rotation.label
-        or "-".join(names)
-    )
+    label = req.rotation.label or "-".join(names)
 
     econ = RotationEconomics(
         years=years,
