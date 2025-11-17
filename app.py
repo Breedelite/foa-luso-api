@@ -126,7 +126,6 @@ def names_from_indices(indices: List[int]) -> List[str]:
 
 from copy import deepcopy
 
-
 def build_scenario_adjusted_inputs(
     scenario: dict | None,
 ) -> tuple[list[dict], dict]:
@@ -134,11 +133,11 @@ def build_scenario_adjusted_inputs(
     Take the global LULIST & PARAMETERS and return copies with
     simple overrides applied from the 'scenario' block.
 
-    Rules (v2, with costs):
+    Rules (v3, with costs):
 
       - If scenario is None or empty: return originals unchanged.
 
-      - Overheads:
+      - Cropping overheads (global):
           scenario["overheads_per_ha"]  -> PARAMETERS["fixedcosts"]
 
       - N price:
@@ -147,13 +146,25 @@ def build_scenario_adjusted_inputs(
       - Wheat / Barley / Canola:
           scenario["wheat"]["price_per_t"]     -> lu["price"]
           scenario["wheat"]["yield_t_ha"]      -> lu["yield"]
-          scenario["wheat"]["var_cost_per_ha"] -> lu["cost"]   (for wheat only)
+          scenario["wheat"]["var_cost_per_ha"] -> lu["cost"]
 
       - Pasture:
-          scenario["pasture"] contains lamb + wool production.
-          We convert this to a single gross revenue per ha
-          and set yield=1.0, price=revenue for all pasture LUs
-          (vpasture, ipasture, npasture).
+          scenario["pasture"] contains lamb + wool production, plus:
+            var_cost_per_ha
+            overheads_per_ha
+
+          We:
+            * convert wool + lamb into a single gross revenue/ha
+              and set yield=1.0, price=revenue *for pasture LUs*
+              (vpasture, ipasture, npasture)
+
+            * set lu["cost"] = pasture.var_cost_per_ha (if given)
+
+            * adjust lu["cost"] again so that *effective* overhead
+              for pasture years == pasture.overheads_per_ha
+
+              (we do this by backing out the difference between
+               cropping overheads and pasture overheads).
     """
 
     # If nothing to do, just hand back the originals
@@ -165,7 +176,7 @@ def build_scenario_adjusted_inputs(
     lulist = deepcopy(LULIST)
     params = dict(PARAMETERS)
 
-    # --- 1) Overhead cost override -----------------------------------
+    # --- 1) Cropping overhead cost override ---------------------------
     oh = scenario.get("overheads_per_ha")
     if isinstance(oh, (int, float)):
         try:
@@ -209,14 +220,18 @@ def build_scenario_adjusted_inputs(
     apply_grain_override("barley", "barley")
     apply_grain_override("canola", "canola")
 
-    # --- 4) Pasture revenue: lamb + wool -----------------------------
+    # --- 4) Pasture revenue + variable + overheads -------------------
     past = scenario.get("pasture")
     if isinstance(past, dict):
-        lamb_kg = past.get("lamb_kg_cwt_ha") or 0
+        lamb_kg    = past.get("lamb_kg_cwt_ha") or 0
         lamb_price = past.get("lamb_price_per_kg") or 0
-        wool_kg = past.get("wool_cfw_kg_ha") or 0
+        wool_kg    = past.get("wool_cfw_kg_ha") or 0
         wool_price = past.get("wool_price_per_kg") or 0
 
+        past_var_cost = past.get("var_cost_per_ha")
+        past_oh       = past.get("overheads_per_ha")
+
+        # compute combined wool + lamb revenue / ha
         try:
             revenue = (
                 float(lamb_kg) * float(lamb_price)
@@ -225,11 +240,43 @@ def build_scenario_adjusted_inputs(
         except Exception:
             revenue = 0.0
 
-        if revenue > 0:
+        # current cropping overhead (after scenario override), if numeric
+        cropping_oh = params.get("fixedcosts")
+        cropping_oh = float(cropping_oh) if isinstance(cropping_oh, (int, float)) else None
+
+        if revenue > 0 or past_var_cost is not None or past_oh is not None:
             for lu in lulist:
                 if lu.get("name") in ("vpasture", "ipasture", "npasture"):
-                    lu["yield"] = 1.0
-                    lu["price"] = float(revenue)
+
+                    # 4a. overwrite revenue if provided
+                    if revenue > 0:
+                        lu["yield"] = 1.0
+                        lu["price"] = float(revenue)
+
+                    # 4b. set pasture variable cost per ha (if given)
+                    if past_var_cost is not None:
+                        lu["cost"] = float(past_var_cost)
+
+                    # 4c. adjust effective overhead via cost difference
+                    if (
+                        past_oh is not None
+                        and isinstance(past_oh, (int, float))
+                        and cropping_oh is not None
+                    ):
+                        # we want pasture overheads to be lower (or higher)
+                        # than the global fixedcosts.
+                        delta = cropping_oh - float(past_oh)
+
+                        # reduce (or increase) the LU's per-ha cost
+                        # to reflect this overhead difference.
+                        current_cost = float(lu.get("cost", 0.0))
+                        adjusted_cost = current_cost - delta
+
+                        # don't let it go negative
+                        if adjusted_cost < 0:
+                            adjusted_cost = 0.0
+
+                        lu["cost"] = adjusted_cost
 
     return lulist, params
 
