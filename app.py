@@ -9,6 +9,7 @@ from copy import deepcopy
 
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
+from numpy import generic as np_generic  # for normalising numpy scalars
 
 # --------------------------------------------------------------------
 # 1. Wire in LUSO model code
@@ -56,6 +57,7 @@ class EvaluateResponse(BaseModel):
     sequence_indices: List[int]
     sequence_names: List[str]
     economics: RotationEconomics
+    raw_details: Optional[List[Dict[str, Any]]] = None
 
 
 # --------------------------------------------------------------------
@@ -104,7 +106,7 @@ def indices_from_rotation(rot: RotationInput) -> List[int]:
     if not rot.name_sequence:
         raise HTTPException(400, "Provide index_sequence OR name_sequence")
 
-    seq = []
+    seq: List[int] = []
     for name in rot.name_sequence:
         idx = convertLUnameToLUI(name, LULIST)
         if LULIST[idx]["name"] != name:
@@ -119,16 +121,22 @@ def names_from_indices(indices: List[int]) -> List[str]:
     return [LULIST[i]["name"] for i in indices]
 
 
-# --------------------------------------------------------------------
-# 5. Core: override economic inputs
-# --------------------------------------------------------------------
+def _normalise_value(v: Any) -> Any:
+    """
+    Convert numpy scalars to plain Python types so FastAPI can JSON-encode them.
+    """
+    if isinstance(v, np_generic):
+        return float(v)
+    return v
 
 
-from copy import deepcopy
+# --------------------------------------------------------------------
+# 5. Core: override economic inputs (scenarios)
+# --------------------------------------------------------------------
 
 def build_scenario_adjusted_inputs(
     scenario: dict | None,
-) -> tuple[list[dict], dict]:
+) -> tuple[List[dict], Dict[str, Any]]:
     """
     Take the global LULIST & PARAMETERS and return copies with
     simple overrides applied from the 'scenario' block.
@@ -163,8 +171,8 @@ def build_scenario_adjusted_inputs(
             * adjust lu["cost"] again so that *effective* overhead
               for pasture years == pasture.overheads_per_ha
 
-              (we do this by backing out the difference between
-               cropping overheads and pasture overheads).
+              (by backing out the difference between cropping overheads
+               and pasture overheads).
     """
 
     # If nothing to do, just hand back the originals
@@ -174,7 +182,7 @@ def build_scenario_adjusted_inputs(
     # Work on copies so the globals stay as the default bundle
     assert LULIST is not None and PARAMETERS is not None
     lulist = deepcopy(LULIST)
-    params = dict(PARAMETERS)
+    params: Dict[str, Any] = dict(PARAMETERS)
 
     # --- 1) Cropping overhead cost override ---------------------------
     oh = scenario.get("overheads_per_ha")
@@ -280,52 +288,90 @@ def build_scenario_adjusted_inputs(
 
     return lulist, params
 
+
 # --------------------------------------------------------------------
 # 6. Deterministic evaluation endpoint
 # --------------------------------------------------------------------
 
 @app.post("/evaluate", response_model=EvaluateResponse)
-def evaluate_rotation(req: EvaluateRequest):
+def evaluate_rotation(req: EvaluateRequest) -> EvaluateResponse:
+    """
+    Deterministic evaluation of a single rotation using the default season.
 
+    - Uses original LUSO profit() for headline numbers
+      (so it matches Roger's script).
+    - Adds raw per-year details from profit(getDetails=True) as `raw_details`.
+    """
     ensure_loaded()
+    assert LULIST is not None and PARAMETERS is not None and OPTIONALPARAMS is not None
 
     indices = indices_from_rotation(req.rotation)
     names = names_from_indices(indices)
 
-    # Adjust inputs for scenario
-    lul_use, params_use = build_scenario_adjusted_inputs(req.scenario)
+    # Build adjusted inputs if a scenario was supplied
+    scenario_data: dict | None = getattr(req, "scenario", None)
+    lulist_use, params_use = build_scenario_adjusted_inputs(scenario_data)
 
-    # Call the LUSO profit function
+    # ----- Headline economics (using original behaviour) -------------
     if req.annualise:
-        per_year = profit(
+        # profit() returns a single "annualised" profit per year
+        profit_per_year = profit(
             indices,
             params_use,
-            lul_use,
+            lulist_use,
             getDetails=False,
             optionalparams=OPTIONALPARAMS,
             annualise=True,
         )
         years = len(indices)
-        total = per_year * years
+        profit_total = profit_per_year * years
     else:
-        total = profit(
+        # profit() returns total profit over the rotation
+        profit_total = profit(
             indices,
             params_use,
-            lul_use,
+            lulist_use,
             getDetails=False,
             optionalparams=OPTIONALPARAMS,
             annualise=False,
         )
         years = len(indices)
-        per_year = total / years
+        profit_per_year = profit_total / years
+
+    # ----- Per-year details (getDetails=True always) -----------------
+    raw = profit(
+        indices,
+        params_use,
+        lulist_use,
+        getDetails=True,
+        optionalparams=OPTIONALPARAMS,
+        annualise=False,
+    )
+
+    if not isinstance(raw, list):
+        raise HTTPException(
+            status_code=500,
+            detail="LUSO profit(getDetails=True) returned an unexpected structure.",
+        )
+
+    details_clean: List[Dict[str, Any]] = []
+    for year_dict in raw:
+        if isinstance(year_dict, dict):
+            cleaned = {k: _normalise_value(v) for k, v in year_dict.items()}
+            details_clean.append(cleaned)
+
+    label = req.rotation.label or "-".join(names)
+
+    econ = RotationEconomics(
+        years=years,
+        profit_total=float(profit_total),
+        profit_per_year=float(profit_per_year),
+    )
 
     return EvaluateResponse(
-        rotation_label=req.rotation.label or "-".join(names),
+        rotation_label=label,
         sequence_indices=indices,
         sequence_names=names,
-        economics=RotationEconomics(
-            years=years,
-            profit_total=float(total),
-            profit_per_year=float(per_year),
-        ),
+        economics=econ,
+        raw_details=details_clean,
     )
