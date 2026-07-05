@@ -7,12 +7,11 @@ from csv import *
 from time import perf_counter  # Updated import
 from math import exp
 from numpy import *
-
 try:
     from pylab import *  # type: ignore
 except ImportError:
-    # pylab/matplotlib not available in this environment.
-    # Plotting functions won't work, but the core economics still will.
+    # pylab/matplotlib not available in the headless Render environment.
+    # Plotting helpers won't work, but the core economics do.
     pass
 from diseasefuncs import *
 
@@ -104,7 +103,12 @@ class State:
             actualCost=lu['costCont']
         extravariablecost = extrayield * lu['extracostperextrayield']
         actualCost+=extravariablecost
-        undiscountedprofit=income-actualCost-Ncost-parameters['fixedcosts']
+        # Net-profit overhead: whole-farm fixed overhead (parameters['fixedcosts'])
+        # PLUS this land use's own enterprise overhead per ha (lu['overhead'],
+        # incl. plant depreciation for cropping). Defaults to 0 when absent so
+        # existing CSV-driven land uses are unaffected.
+        overhead=parameters['fixedcosts']+lu.get('overhead',0)
+        undiscountedprofit=income-actualCost-Ncost-overhead
         profit=self.discount*undiscountedprofit
         self.discount=self.discount*(1-parameters['discountrate'])
         if lu['name']=='canola':
@@ -133,7 +137,7 @@ class State:
                      ('yield',yieldd),
                      ('price',actualprice),
                      ('income',income),
-                     ('cost',actualCost+parameters['fixedcosts']),
+                     ('cost',actualCost+overhead),
                      ('Ncost',Ncost),
                      ('disease',self.disease),
                      ('diseaseImpact',diseaseImpact),
@@ -348,7 +352,7 @@ def testall(ny,nlu,parameters,lulist,stochMultsUsed=None,optionalparams=None):
         ii=i
         for y in range(ny):
             thisbit=ii%nlu
-            ii=(ii-thisbit)/nlu
+            ii=(ii-thisbit)//nlu
             lus.append(thisbit)
         p=profit(lus,parameters,lulist,stochMultsUsed=stochMultsUsed,optionalparams=optionalparams)
         #print lus,p
@@ -364,7 +368,7 @@ def testall(ny,nlu,parameters,lulist,stochMultsUsed=None,optionalparams=None):
     return bestlus
 
 #### optimise LUS by testing combinations of main landuses, breaks, break frequencies
-def testBreak(ny,nlu,parameters,lulist,optionalparams=None):
+def testBreak(ny,nlu,parameters,lulist,optionalparams=None,stochMultsUsed=None):
     for i in range(5): print("#######################")
     print("testing break")
     starttime=perf_counter()
@@ -451,7 +455,7 @@ def testalltactical(thisyear,ny,nlu,parameters,lulist,suppress=False,parameters2
         ii=i
         for y in range(ny):
             thisbit=ii%nlu
-            ii=(ii-thisbit)/nlu
+            ii=(ii-thisbit)//nlu
             lus.append(thisbit)
         p=profit(lus,parameters,lulist,parameters2=parameters2,lulist2=lulist2,optionalparams=optionalparams)
         #print lus,p
@@ -467,14 +471,14 @@ def testalltactical(thisyear,ny,nlu,parameters,lulist,suppress=False,parameters2
     return bestlus
 
 ###### optimise over all possible LUS by testing all, and return best nsols solutions in list
-def testallMultiSols(ny,nlu,nsols,parameters,lulist,optionalparams=None):
+def testallMultiSols(ny,nlu,nsols,parameters,lulist,optionalparams=None,stochMultsUsed=None):
     bestluslist=[[-99999,'invalid']]*nsols
     for i in range(nlu**ny):
         lus=[]
         ii=i
         for y in range(ny):
             thisbit=ii%nlu
-            ii=(ii-thisbit)/nlu
+            ii=(ii-thisbit)//nlu
             lus.append(thisbit)
         p=profit(lus,parameters,lulist,stochMultsUsed=stochMultsUsed,optionalparams=optionalparams)
         if bestluslist[0][0]<p:
@@ -520,7 +524,7 @@ def randsearch(ny,nsols,parameters,lulist,maxstuck=10000,collectData=False,optio
         return bestluslist
 
 ###### optimise by using annealing algorithm (similar to Graeme's I think)
-def anneal(lus,nt,parameters,lulist,starttemp=1000,mintemp=0.1,maxstuck=100000,optionalparams=None):
+def anneal(lus,nt,parameters,lulist,starttemp=1000,mintemp=0.1,maxstuck=100000,optionalparams=None,stochMultsUsed=None):
     for i in range(5): print("#######################")
     print("annealing")
     starttime=perf_counter()
