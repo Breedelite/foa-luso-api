@@ -43,7 +43,18 @@ class RotationInput(BaseModel):
 class EvaluateRequest(BaseModel):
     rotation: RotationInput
     annualise: bool = True
+    # LEGACY path (kept for backward compatibility): the old hard-coded
+    # scenario-override block against the startup CSV land uses.
     scenario: Optional[Dict[str, Any]] = None
+    # STATELESS path (preferred): FileMaker supplies the finished inputs.
+    # Each land_use uses engine-native keys: name, label, yield, price, cost,
+    # costCont, Nreq, IEprevcrop, DEcrop, NboostperTonne, weedsurvival,
+    # compindex, sowdensity, weedseedreturn, watermult, extracostperextrayield,
+    # overhead. When land_uses is provided the CSV globals are NOT used.
+    land_uses: Optional[List[Dict[str, Any]]] = None
+    parameters: Optional[Dict[str, Any]] = None
+    additional_effects: Optional[List[Dict[str, Any]]] = None
+    disallowed_combos: Optional[List[List[Any]]] = None
 
 
 class RotationEconomics(BaseModel):
@@ -64,11 +75,25 @@ class EvaluateResponse(BaseModel):
 # 3. FastAPI app + global LUSO data
 # --------------------------------------------------------------------
 
-app = FastAPI(title="FOA LUSO Deterministic API", version="0.2")
+app = FastAPI(title="FOA LUSO Decision API", version="0.3")
 
 @app.get("/health")
 def health():
     return {"status": "ok"}
+
+@app.get("/landuses")
+def landuses():
+    """Return the land-use roster currently loaded from the startup CSV, so
+    FileMaker can sync names/indices. Stateless calls supply their own
+    land_uses and do not depend on this."""
+    ensure_loaded()
+    return {
+        "count": len(LULIST),
+        "land_uses": [
+            {"index": i, "name": lu["name"], "label": lu.get("label")}
+            for i, lu in enumerate(LULIST)
+        ],
+    }
 
 LULIST = None
 PARAMETERS = None
@@ -97,28 +122,27 @@ def ensure_loaded():
         raise HTTPException(status_code=500, detail="LUSO inputs not loaded.")
 
 
-def indices_from_rotation(rot: RotationInput) -> List[int]:
-    ensure_loaded()
-
+def indices_from_rotation(rot: RotationInput, lulist: List[dict]) -> List[int]:
+    """Resolve a rotation to land-use indices against the supplied lulist
+    (works for both the stateless land_uses and the CSV globals)."""
     if rot.index_sequence:
         return rot.index_sequence
 
     if not rot.name_sequence:
         raise HTTPException(400, "Provide index_sequence OR name_sequence")
 
+    name_to_idx = {lu["name"]: i for i, lu in enumerate(lulist)}
     seq: List[int] = []
     for name in rot.name_sequence:
-        idx = convertLUnameToLUI(name, LULIST)
-        if LULIST[idx]["name"] != name:
+        if name not in name_to_idx:
             raise HTTPException(400, f"Unknown land-use {name}")
-        seq.append(idx)
+        seq.append(name_to_idx[name])
 
     return seq
 
 
-def names_from_indices(indices: List[int]) -> List[str]:
-    ensure_loaded()
-    return [LULIST[i]["name"] for i in indices]
+def names_from_indices(indices: List[int], lulist: List[dict]) -> List[str]:
+    return [lulist[i]["name"] for i in indices]
 
 
 def _normalise_value(v: Any) -> Any:
@@ -128,6 +152,94 @@ def _normalise_value(v: Any) -> Any:
     if isinstance(v, np_generic):
         return float(v)
     return v
+
+
+# --------------------------------------------------------------------
+# 4b. Stateless input builders (FileMaker supplies the finished inputs)
+# --------------------------------------------------------------------
+
+# Engine-native numeric keys expected on each supplied land use.
+_LU_NUMERIC_KEYS = [
+    "yield", "price", "cost", "costCont", "Nreq", "IEprevcrop", "DEcrop",
+    "NboostperTonne", "weedsurvival", "compindex", "sowdensity",
+    "weedseedreturn", "watermult", "extracostperextrayield", "overhead",
+]
+
+# Safe defaults so a missing key never crashes the engine.
+_PARAM_DEFAULTS: Dict[str, float] = {
+    "season": 1.0, "fixedcosts": 0.0, "discountrate": 0.0, "Ncost": 0.0,
+    "seedbank0": 0.0, "N0": 0.0, "DI0": 0.0, "DImin": 0.0,
+    "weedgermination": 0.0, "weedcompindex": 0.0, "weedmaxseedset": 0.0,
+    "IEprevinc": 0.0, "IErandom": 0.0, "DEinc": 0.0, "DErandom": 0.0,
+    "costperweedseed": 0.0,
+}
+
+
+def _coerce_land_uses(land_uses: List[Dict[str, Any]]) -> List[dict]:
+    """Normalise a supplied land_uses list into engine-shaped dicts (floats)."""
+    out: List[dict] = []
+    for lu in land_uses:
+        d = dict(lu)
+        d["name"] = str(d.get("name", ""))
+        d.setdefault("label", d["name"])
+        for k in _LU_NUMERIC_KEYS:
+            try:
+                d[k] = float(d.get(k, 0) or 0)
+            except (TypeError, ValueError):
+                d[k] = 0.0
+        out.append(d)
+    return out
+
+
+def _build_parameters(parameters: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    """Merge supplied parameters over safe defaults; force a default season."""
+    p: Dict[str, Any] = dict(_PARAM_DEFAULTS)
+    if parameters:
+        for k, v in parameters.items():
+            try:
+                p[k] = float(v)
+            except (TypeError, ValueError):
+                p[k] = v
+    if not p.get("season"):
+        p["season"] = 1.0
+    return p
+
+
+def _build_optionalparams(
+    lulist: List[dict],
+    additional_effects: Optional[List[Dict[str, Any]]],
+    disallowed_combos: Optional[List[List[Any]]],
+) -> Dict[str, Any]:
+    """Build the engine's optionalparams from name-based request data,
+    converting land-use names to indices against the supplied lulist."""
+    name_to_idx = {lu["name"]: i for i, lu in enumerate(lulist)}
+
+    addefflist: List[dict] = []
+    for ae in (additional_effects or []):
+        il = name_to_idx.get(ae.get("initiallu"))
+        ll = name_to_idx.get(ae.get("laterlu"))
+        if il is None or ll is None:
+            continue
+        try:
+            addefflist.append({
+                "initiallu": il, "laterlu": ll,
+                "yearsbetween": int(ae["yearsbetween"]),
+                "effectonlaterlu": float(ae["effectonlaterlu"]),
+            })
+        except (KeyError, TypeError, ValueError):
+            continue
+
+    combos: List[list] = []
+    for c in (disallowed_combos or []):
+        if not c:
+            continue
+        try:
+            conv = [int(c[0])] + [name_to_idx[n] for n in c[1:] if n in name_to_idx]
+        except (TypeError, ValueError):
+            continue
+        combos.append(conv)
+
+    return {"disallowedcombos": combos, "addefflist": addefflist, "pricevarlist": []}
 
 
 # --------------------------------------------------------------------
@@ -302,50 +414,48 @@ def evaluate_rotation(req: EvaluateRequest) -> EvaluateResponse:
       (so it matches Roger's script).
     - Adds raw per-year details from profit(getDetails=True) as `raw_details`.
     """
-    ensure_loaded()
-    assert LULIST is not None and PARAMETERS is not None and OPTIONALPARAMS is not None
+    # Resolve inputs. Two modes:
+    #  - STATELESS (preferred): FileMaker supplies the finished land_uses[]
+    #    (library + scenario overrides + grazing economics already applied),
+    #    plus parameters and optional effects. The API just evaluates them.
+    #  - LEGACY: no land_uses -> use the startup CSV globals + the old
+    #    hard-coded scenario-override block (kept for backward compatibility).
+    if req.land_uses:
+        lulist_use = _coerce_land_uses(req.land_uses)
+        params_use = _build_parameters(req.parameters)
+        optional_use = _build_optionalparams(
+            lulist_use, req.additional_effects, req.disallowed_combos
+        )
+    else:
+        ensure_loaded()
+        lulist_use, params_use = build_scenario_adjusted_inputs(
+            getattr(req, "scenario", None)
+        )
+        optional_use = OPTIONALPARAMS
 
-    indices = indices_from_rotation(req.rotation)
-    names = names_from_indices(indices)
+    indices = indices_from_rotation(req.rotation, lulist_use)
+    names = names_from_indices(indices, lulist_use)
 
-    # Build adjusted inputs if a scenario was supplied
-    scenario_data: dict | None = getattr(req, "scenario", None)
-    lulist_use, params_use = build_scenario_adjusted_inputs(scenario_data)
-
-    # ----- Headline economics (using original behaviour) -------------
+    # ----- Headline economics (net profit; profit() now nets overhead) ----
     if req.annualise:
-        # profit() returns a single "annualised" profit per year
         profit_per_year = profit(
-            indices,
-            params_use,
-            lulist_use,
-            getDetails=False,
-            optionalparams=OPTIONALPARAMS,
-            annualise=True,
+            indices, params_use, lulist_use,
+            getDetails=False, optionalparams=optional_use, annualise=True,
         )
         years = len(indices)
         profit_total = profit_per_year * years
     else:
-        # profit() returns total profit over the rotation
         profit_total = profit(
-            indices,
-            params_use,
-            lulist_use,
-            getDetails=False,
-            optionalparams=OPTIONALPARAMS,
-            annualise=False,
+            indices, params_use, lulist_use,
+            getDetails=False, optionalparams=optional_use, annualise=False,
         )
         years = len(indices)
         profit_per_year = profit_total / years
 
-    # ----- Per-year details (getDetails=True always) -----------------
+    # ----- Per-year details -----
     raw = profit(
-        indices,
-        params_use,
-        lulist_use,
-        getDetails=True,
-        optionalparams=OPTIONALPARAMS,
-        annualise=False,
+        indices, params_use, lulist_use,
+        getDetails=True, optionalparams=optional_use, annualise=False,
     )
 
     if not isinstance(raw, list):
