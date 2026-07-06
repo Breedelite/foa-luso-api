@@ -27,7 +27,7 @@ if not inputs_dir.exists():
 sys.path.append(str(files_dir))
 
 from readers import readinLUlist, readinparams, readoptionalparams  # type: ignore
-from lusofuncs import profit, convertLUnameToLUI  # type: ignore
+from lusofuncs import profit, convertLUnameToLUI, testallMultiSols  # type: ignore
 
 
 # --------------------------------------------------------------------
@@ -485,3 +485,84 @@ def evaluate_rotation(req: EvaluateRequest) -> EvaluateResponse:
         economics=econ,
         raw_details=details_clean,
     )
+
+
+# --------------------------------------------------------------------
+# 7. Optimiser endpoint — find the most profitable rotation(s)
+# --------------------------------------------------------------------
+
+class OptimiseRequest(BaseModel):
+    years: Optional[int] = None          # rotation length; defaults to parameters.nyears
+    nsols: int = 10                      # how many top rotations to return
+    land_uses: Optional[List[Dict[str, Any]]] = None
+    parameters: Optional[Dict[str, Any]] = None
+    additional_effects: Optional[List[Dict[str, Any]]] = None
+    disallowed_combos: Optional[List[List[Any]]] = None
+
+
+# Exhaustive search evaluates nlu**years rotations. Cap it so a large
+# library can't hang the request. (6 land uses x 6 yrs = 46,656; fine.)
+EXHAUSTIVE_CAP = 200_000
+
+
+@app.post("/optimise")
+def optimise(req: OptimiseRequest):
+    """Exhaustively find the top-N most profitable rotations for the supplied
+    land uses / parameters. Returns them ranked best-first. Uses the same
+    net-profit engine as /evaluate (incl. the end-of-rotation seed-bank
+    penalty), so a rotation's profit here matches evaluating it directly."""
+    if req.land_uses:
+        lulist_use = _coerce_land_uses(req.land_uses)
+        params_use = _build_parameters(req.parameters)
+        optional_use = _build_optionalparams(
+            lulist_use, req.additional_effects, req.disallowed_combos
+        )
+    else:
+        ensure_loaded()
+        lulist_use = LULIST
+        params_use = dict(PARAMETERS)
+        optional_use = OPTIONALPARAMS
+
+    nlu = len(lulist_use)
+    ny = req.years or int(params_use.get("nyears") or 0)
+    if nlu < 1:
+        raise HTTPException(400, "No land uses supplied to optimise over.")
+    if ny < 1:
+        raise HTTPException(400, "Provide 'years' (rotation length) or parameters.nyears >= 1.")
+
+    combos = nlu ** ny
+    if combos > EXHAUSTIVE_CAP:
+        raise HTTPException(
+            400,
+            f"Search space too large: {nlu} land uses ^ {ny} years = {combos:,} "
+            f"combinations (cap {EXHAUSTIVE_CAP:,}). Reduce the number of land uses "
+            f"or the rotation length.",
+        )
+
+    nsols = max(1, min(req.nsols, 50))
+    best = testallMultiSols(ny, nlu, nsols, params_use, lulist_use, optionalparams=optional_use)
+
+    # testallMultiSols returns [[profit, [indices]], ...] ascending, with
+    # possible [-99999, 'invalid'] placeholders. Keep real ones, best-first.
+    rows = [b for b in best if isinstance(b[1], list)]
+    rows.sort(key=lambda b: b[0], reverse=True)
+
+    rotations = []
+    for rank, (p, lus) in enumerate(rows, start=1):
+        p = float(_normalise_value(p))
+        rotations.append({
+            "rank": rank,
+            "profit_total": p,
+            "profit_per_year": p / ny,
+            "sequence_indices": list(lus),
+            "sequence_names": [lulist_use[i]["name"] for i in lus],
+            "label": "-".join(lulist_use[i].get("label") or lulist_use[i]["name"] for i in lus),
+        })
+
+    return {
+        "method": "exhaustive",
+        "years": ny,
+        "land_uses_count": nlu,
+        "combinations_evaluated": combos,
+        "rotations": rotations,
+    }
