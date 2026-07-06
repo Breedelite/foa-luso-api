@@ -3,12 +3,14 @@ from __future__ import annotations
 
 import os
 import sys
+import random
 from pathlib import Path
 from typing import List, Optional, Dict, Any
 from copy import deepcopy
 
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
+import numpy as np
 from numpy import generic as np_generic  # for normalising numpy scalars
 
 # --------------------------------------------------------------------
@@ -26,7 +28,7 @@ if not inputs_dir.exists():
 
 sys.path.append(str(files_dir))
 
-from readers import readinLUlist, readinparams, readoptionalparams  # type: ignore
+from readers import readinLUlist, readinparams, readoptionalparams, readinstochMults  # type: ignore
 from lusofuncs import profit, convertLUnameToLUI, testallMultiSols  # type: ignore
 
 
@@ -98,11 +100,12 @@ def landuses():
 LULIST = None
 PARAMETERS = None
 OPTIONALPARAMS = None
+STOCHMULTS = []   # default season table for Monte-Carlo (overridable per request)
 
 
 @app.on_event("startup")
 def startup_event():
-    global LULIST, PARAMETERS, OPTIONALPARAMS
+    global LULIST, PARAMETERS, OPTIONALPARAMS, STOCHMULTS
 
     os.chdir(BASE_DIR)
 
@@ -110,6 +113,12 @@ def startup_event():
     LULIST = readinLUlist("_LUSdetails_used.csv")
     PARAMETERS = readinparams("_parameters_used.csv")
     OPTIONALPARAMS = readoptionalparams(LULIST)
+    try:
+        STOCHMULTS = readinstochMults("_stochasticParameters_used.csv")
+        print(f"[startup] Loaded {len(STOCHMULTS)} default season types.")
+    except Exception as e:
+        STOCHMULTS = []
+        print(f"[startup] No default season table loaded ({e}).")
     print(f"[startup] Loaded {len(LULIST)} land uses.")
 
 
@@ -565,4 +574,110 @@ def optimise(req: OptimiseRequest):
         "land_uses_count": nlu,
         "combinations_evaluated": combos,
         "rotations": rotations,
+    }
+
+
+# --------------------------------------------------------------------
+# 8. Monte-Carlo simulation endpoint — distribution of outcomes
+# --------------------------------------------------------------------
+
+class SimulateRequest(BaseModel):
+    rotation: RotationInput
+    reps: int = 1000                       # number of simulated season sequences
+    with_replacement: bool = False         # sample season sequence with/without replacement
+    seed: Optional[int] = None             # fix for reproducible distributions
+    land_uses: Optional[List[Dict[str, Any]]] = None
+    parameters: Optional[Dict[str, Any]] = None
+    additional_effects: Optional[List[Dict[str, Any]]] = None
+    disallowed_combos: Optional[List[List[Any]]] = None
+    # Per-season stochastic multipliers. Each season is a dict with keys
+    # IEseason, DEseason, weedSeed, weedComp, NReq, Nlost, plus a yield
+    # multiplier per land-use name. If omitted, the bundled default table is used.
+    seasons: Optional[List[Dict[str, Any]]] = None
+
+
+def _coerce_season(s: Dict[str, Any]) -> Dict[str, Any]:
+    out: Dict[str, Any] = {}
+    for k, v in s.items():
+        if k == "label":
+            out[k] = v
+            continue
+        try:
+            out[k] = float(v)
+        except (TypeError, ValueError):
+            out[k] = v
+    return out
+
+
+@app.post("/simulate")
+def simulate(req: SimulateRequest):
+    """Monte-Carlo the rotation across many sampled season sequences and return
+    the distribution of net-profit outcomes (mean, median, p10-p90, probability
+    of loss, risk-adjusted ratio, histogram). Uses the same net-profit engine as
+    /evaluate. Season variability comes from `seasons` (or the bundled default)."""
+    if req.land_uses:
+        lulist_use = _coerce_land_uses(req.land_uses)
+        params_use = _build_parameters(req.parameters)
+        optional_use = _build_optionalparams(
+            lulist_use, req.additional_effects, req.disallowed_combos
+        )
+    else:
+        ensure_loaded()
+        lulist_use = LULIST
+        params_use = dict(PARAMETERS)
+        optional_use = OPTIONALPARAMS
+
+    indices = indices_from_rotation(req.rotation, lulist_use)
+    names = names_from_indices(indices, lulist_use)
+
+    seasons = req.seasons if req.seasons else STOCHMULTS
+    if not seasons:
+        raise HTTPException(400, "No season data: provide 'seasons' or bundle a default table.")
+    seasons = [_coerce_season(s) for s in seasons]
+
+    nseason = len(seasons)
+    ny = len(indices)
+    reps = max(1, min(int(req.reps), 5000))
+    random.seed(req.seed if req.seed is not None else 12345)
+
+    profits: List[float] = []
+    for _ in range(reps):
+        if req.with_replacement or ny > nseason:
+            seq = [random.choice(seasons) for _ in range(ny)]
+        else:
+            seq = random.sample(seasons, ny)
+        p = profit(
+            indices, params_use, lulist_use,
+            optionalparams=optional_use, stochMultsUsed=seq, pureRandomEffects=True,
+        )
+        profits.append(float(_normalise_value(p)))
+
+    arr = np.array(profits, dtype=float)
+    p10, p25, p50, p75, p90 = [float(x) for x in np.percentile(arr, [10, 25, 50, 75, 90])]
+    counts, edges = np.histogram(arr, bins=20)
+    std = float(arr.std())
+    mean = float(arr.mean())
+
+    return {
+        "rotation_label": req.rotation.label or "-".join(names),
+        "sequence_names": names,
+        "season_types": nseason,
+        "distribution": {
+            "reps": reps,
+            "years": ny,
+            "mean_total": mean,
+            "mean_per_year": mean / ny,
+            "median_total": float(np.median(arr)),
+            "median_per_year": float(np.median(arr)) / ny,
+            "std_dev": std,
+            "min": float(arr.min()),
+            "max": float(arr.max()),
+            "p10": p10, "p25": p25, "p50": p50, "p75": p75, "p90": p90,
+            "prob_negative": float((arr < 0).mean()),
+            "sharpe_like": (mean / std if std != 0 else None),
+            "histogram": {
+                "bin_edges": [float(e) for e in edges],
+                "bin_counts": [int(c) for c in counts],
+            },
+        },
     }
