@@ -509,9 +509,60 @@ class OptimiseRequest(BaseModel):
     disallowed_combos: Optional[List[List[Any]]] = None
 
 
-# Exhaustive search evaluates nlu**years rotations. Cap it so a large
-# library can't hang the request. (6 land uses x 6 yrs = 46,656; fine.)
-EXHAUSTIVE_CAP = 200_000
+# Exhaustive search evaluates nlu**years rotations. Above this many combos we
+# switch to a fast sampled (random) search so a long rotation / large library
+# can't make the request grind. (6 land uses x 6 yrs = 46,656 -> still exact.)
+EXHAUSTIVE_CAP = 50_000
+
+
+def _heuristic_search(ny, nlu, nsols, params, lulist, optionalparams,
+                      eval_budget=30_000, max_sweeps=6):
+    """Scalable optimiser for large search spaces (long rotations / many land
+    uses) where exhaustive search is infeasible. Random-restart coordinate
+    ascent: from each start, repeatedly set each year to the land use that
+    maximises net profit given the others, sweeping until stable. Collects the
+    distinct local optima and returns the top-N. Deterministic (fixed seed).
+    Uses the same net-profit engine as exhaustive, so profits are directly
+    comparable, and total work is bounded regardless of rotation length."""
+    rng = random.Random(12345)
+
+    def pf(lus):
+        return float(_normalise_value(
+            profit(lus, params, lulist, optionalparams=optionalparams)
+        ))
+
+    # Bound total work: each restart costs up to max_sweeps*ny*(nlu-1) evals,
+    # so longer rotations simply get fewer restarts (wall time stays ~constant).
+    per_restart = max(1, max_sweeps * ny * max(1, nlu - 1))
+    restarts = max(8, min(40, eval_budget // per_restart))
+
+    results = {}  # tuple(lus) -> profit
+    for r in range(restarts):
+        # First restart = single-land-use baseline; the rest are random.
+        lus = [0] * ny if r == 0 else [rng.randint(0, nlu - 1) for _ in range(ny)]
+        cur = pf(lus)
+        for _ in range(max_sweeps):
+            improved = False
+            for i in range(ny):
+                orig = lus[i]
+                best_c, best_p = orig, cur
+                for c in range(nlu):
+                    if c == orig:
+                        continue
+                    lus[i] = c
+                    p = pf(lus)
+                    if p > best_p:
+                        best_p, best_c = p, c
+                lus[i] = best_c
+                if best_c != orig:
+                    cur, improved = best_p, True
+            if not improved:
+                break
+        results[tuple(lus)] = cur
+
+    ranked = sorted(([p, list(k)] for k, p in results.items()),
+                    key=lambda b: b[0], reverse=True)
+    return ranked[:nsols]
 
 
 @app.post("/optimise")
@@ -539,17 +590,14 @@ def optimise(req: OptimiseRequest):
     if ny < 1:
         raise HTTPException(400, "Provide 'years' (rotation length) or parameters.nyears >= 1.")
 
-    combos = nlu ** ny
-    if combos > EXHAUSTIVE_CAP:
-        raise HTTPException(
-            400,
-            f"Search space too large: {nlu} land uses ^ {ny} years = {combos:,} "
-            f"combinations (cap {EXHAUSTIVE_CAP:,}). Reduce the number of land uses "
-            f"or the rotation length.",
-        )
-
     nsols = max(1, min(req.nsols, 50))
-    best = testallMultiSols(ny, nlu, nsols, params_use, lulist_use, optionalparams=optional_use)
+    combos = nlu ** ny
+    if combos <= EXHAUSTIVE_CAP:
+        best = testallMultiSols(ny, nlu, nsols, params_use, lulist_use, optionalparams=optional_use)
+        method = "exhaustive"
+    else:
+        best = _heuristic_search(ny, nlu, nsols, params_use, lulist_use, optional_use)
+        method = "heuristic"
 
     # testallMultiSols returns [[profit, [indices]], ...] ascending, with
     # possible [-99999, 'invalid'] placeholders. Keep real ones, best-first.
