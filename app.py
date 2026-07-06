@@ -594,6 +594,11 @@ class SimulateRequest(BaseModel):
     # IEseason, DEseason, weedSeed, weedComp, NReq, Nlost, plus a yield
     # multiplier per land-use name. If omitted, the bundled default table is used.
     seasons: Optional[List[Dict[str, Any]]] = None
+    # Alternative (preferred, member-grounded): a reference (wheat) yield-
+    # multiplier per historical year, e.g. APSIM FrostHeatYield / mean. The API
+    # expands each into a per-crop season via land_uses[].beta:
+    #   crop_mult = 1 + beta * (m - 1)   (weed/disease/N held neutral).
+    yield_multipliers: Optional[List[float]] = None
 
 
 def _coerce_season(s: Dict[str, Any]) -> Dict[str, Any]:
@@ -607,6 +612,30 @@ def _coerce_season(s: Dict[str, Any]) -> Dict[str, Any]:
         except (TypeError, ValueError):
             out[k] = v
     return out
+
+
+def _seasons_from_multipliers(mults: List[Any], lulist: List[dict]) -> List[dict]:
+    """Expand a reference (wheat) yield-multiplier series into per-crop season
+    dicts using each land use's beta. Weed/disease/N effects held neutral."""
+    seasons: List[dict] = []
+    for i, m in enumerate(mults):
+        try:
+            m = float(m)
+        except (TypeError, ValueError):
+            continue
+        s: Dict[str, Any] = {
+            "label": str(i + 1),  # profit() reads season['label']
+            "IEseason": 1.0, "DEseason": 1.0, "weedSeed": 1.0,
+            "weedComp": 1.0, "NReq": 1.0, "Nlost": 0.0,
+        }
+        for lu in lulist:
+            try:
+                beta = float(lu.get("beta") or 1.0)
+            except (TypeError, ValueError):
+                beta = 1.0
+            s[lu["name"]] = 1.0 + beta * (m - 1.0)
+        seasons.append(s)
+    return seasons
 
 
 @app.post("/simulate")
@@ -630,10 +659,14 @@ def simulate(req: SimulateRequest):
     indices = indices_from_rotation(req.rotation, lulist_use)
     names = names_from_indices(indices, lulist_use)
 
-    seasons = req.seasons if req.seasons else STOCHMULTS
+    if req.yield_multipliers:
+        seasons = _seasons_from_multipliers(req.yield_multipliers, lulist_use)
+    elif req.seasons:
+        seasons = [_coerce_season(s) for s in req.seasons]
+    else:
+        seasons = STOCHMULTS
     if not seasons:
-        raise HTTPException(400, "No season data: provide 'seasons' or bundle a default table.")
-    seasons = [_coerce_season(s) for s in seasons]
+        raise HTTPException(400, "No season data: provide 'yield_multipliers', 'seasons', or bundle a default table.")
 
     nseason = len(seasons)
     ny = len(indices)
