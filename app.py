@@ -617,10 +617,9 @@ def optimise(req: OptimiseRequest):
         })
 
     return {
-        "method": "exhaustive",
+        "method": method,
         "years": ny,
         "land_uses_count": nlu,
-        "combinations_evaluated": combos,
         "rotations": rotations,
     }
 
