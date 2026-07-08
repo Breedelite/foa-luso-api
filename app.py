@@ -850,7 +850,9 @@ def soil_match(req: SoilMatchRequest):
         "profile": APSOIL_PROFILES.get(str(best["apsoil"])),
         "candidates": [
             {"apsoil": s["apsoil"], "name": s["name"],
-             "soiltype": s["soiltype"], "pawc_per_m": s["pawc_per_m"]}
+             "soiltype": s["soiltype"], "pawc_per_m": s["pawc_per_m"],
+             "pawc": s["pawc"], "depth_mm": s["depth_mm"],
+             "profile": APSOIL_PROFILES.get(str(s["apsoil"]))}
             for s in ranked
         ],
     }
@@ -868,5 +870,9 @@ def soil_profile(apsoil: int):
     return {
         "apsoil": apsoil,
         "name": meta["name"] if meta else str(apsoil),
+        "soiltype": meta["soiltype"] if meta else prof.get("soiltype"),
+        "pawc": meta["pawc"] if meta else None,
+        "pawc_per_m": meta["pawc_per_m"] if meta else None,
+        "depth_mm": meta["depth_mm"] if meta else None,
         "profile": prof,
     }
