@@ -3,6 +3,8 @@ from __future__ import annotations
 
 import os
 import sys
+import json
+import math
 import random
 from pathlib import Path
 from typing import List, Optional, Dict, Any
@@ -101,11 +103,12 @@ LULIST = None
 PARAMETERS = None
 OPTIONALPARAMS = None
 STOCHMULTS = []   # default season table for Monte-Carlo (overridable per request)
+APSOIL_INDEX = []  # APSoil DB summary for soil matching (apsoil, lat, lon, soiltype, pawc_per_m)
 
 
 @app.on_event("startup")
 def startup_event():
-    global LULIST, PARAMETERS, OPTIONALPARAMS, STOCHMULTS
+    global LULIST, PARAMETERS, OPTIONALPARAMS, STOCHMULTS, APSOIL_INDEX
 
     os.chdir(BASE_DIR)
 
@@ -119,6 +122,12 @@ def startup_event():
     except Exception as e:
         STOCHMULTS = []
         print(f"[startup] No default season table loaded ({e}).")
+    try:
+        APSOIL_INDEX = json.load(open(BASE_DIR / "apsoil_index.json"))
+        print(f"[startup] Loaded {len(APSOIL_INDEX)} APSoil profiles for soil matching.")
+    except Exception as e:
+        APSOIL_INDEX = []
+        print(f"[startup] No APSoil index loaded ({e}).")
     print(f"[startup] Loaded {len(LULIST)} land uses.")
 
 
@@ -760,4 +769,80 @@ def simulate(req: SimulateRequest):
                 "bin_counts": [int(c) for c in counts],
             },
         },
+    }
+
+
+# --------------------------------------------------------------------
+# 8. Soil matching — pick the AgriYield-Z soil that best matches the
+#    member's actual local soil, by soil type then water-holding/metre.
+# --------------------------------------------------------------------
+
+class SoilMatchRequest(BaseModel):
+    latitude: float
+    longitude: float
+    available: List[int]              # APSoil numbers simulated at the member's grid cell
+    cultivar: Optional[str] = None    # accepted for convenience; not used in the match
+
+
+def _nearest_apsoil(lat, lon):
+    coslat = math.cos(math.radians(lat))
+    best, bestd = None, None
+    for s in APSOIL_INDEX:
+        d = (s["lat"] - lat) ** 2 + ((s["lon"] - lon) * coslat) ** 2
+        if bestd is None or d < bestd:
+            best, bestd = s, d
+    return best
+
+
+@app.post("/soil-match")
+def soil_match(req: SoilMatchRequest):
+    """Deterministic base-case soil: find the member's nearest actual soil in
+    the APSoil DB, then choose the soil (from those simulated at their grid
+    cell) that best matches it by SOIL TYPE first, then water-holding per metre
+    (PAWC/m) - so a bleached sand maps to a deep sand, not a shallow clay loam
+    that only shares a total-PAWC number because it is shallower."""
+    if not APSOIL_INDEX:
+        raise HTTPException(500, "APSoil index not loaded on the server.")
+    by = {s["apsoil"]: s for s in APSOIL_INDEX}
+    cands = [by[a] for a in req.available if a in by]
+    if not cands:
+        raise HTTPException(400, "None of the supplied 'available' soils are in the APSoil database.")
+
+    local = _nearest_apsoil(req.latitude, req.longitude)
+    coslat = math.cos(math.radians(req.latitude))
+    local_km = round(math.hypot(local["lat"] - req.latitude,
+                                (local["lon"] - req.longitude) * coslat) * 111, 1)
+    lt = (local["soiltype"] or "").lower()
+    ranked = sorted(cands, key=lambda s: ((s["soiltype"] or "").lower() != lt,
+                                          abs(s["pawc_per_m"] - local["pawc_per_m"])))
+    best = ranked[0]
+    same = (best["soiltype"] or "").lower() == lt
+    reason = (
+        f"Your nearest mapped soil is {local['name']} ({local['soiltype']}, "
+        f"{local['pawc_per_m']} mm/m plant-available water, {local_km} km away). "
+        + (f"{best['name']} is the closest available match - same soil type "
+           f"({best['soiltype']}) with similar water-holding ({best['pawc_per_m']} mm/m)."
+           if same else
+           f"No exact soil-type match is simulated here, so {best['name']} "
+           f"({best['soiltype']}, {best['pawc_per_m']} mm/m) is the closest by water-holding.")
+    )
+    return {
+        "apsoil": best["apsoil"],
+        "name": best["name"],
+        "soiltype": best["soiltype"],
+        "pawc": best["pawc"],
+        "pawc_per_m": best["pawc_per_m"],
+        "depth_mm": best["depth_mm"],
+        "same_type": same,
+        "local": {
+            "apsoil": local["apsoil"], "name": local["name"],
+            "soiltype": local["soiltype"], "pawc_per_m": local["pawc_per_m"],
+            "distance_km": local_km,
+        },
+        "reason": reason,
+        "candidates": [
+            {"apsoil": s["apsoil"], "name": s["name"],
+             "soiltype": s["soiltype"], "pawc_per_m": s["pawc_per_m"]}
+            for s in ranked
+        ],
     }
