@@ -104,11 +104,12 @@ PARAMETERS = None
 OPTIONALPARAMS = None
 STOCHMULTS = []   # default season table for Monte-Carlo (overridable per request)
 APSOIL_INDEX = []  # APSoil DB summary for soil matching (apsoil, lat, lon, soiltype, pawc_per_m)
+APSOIL_PROFILES = {}  # per-layer water profiles keyed by str(apsoil) - drives the depth chart
 
 
 @app.on_event("startup")
 def startup_event():
-    global LULIST, PARAMETERS, OPTIONALPARAMS, STOCHMULTS, APSOIL_INDEX
+    global LULIST, PARAMETERS, OPTIONALPARAMS, STOCHMULTS, APSOIL_INDEX, APSOIL_PROFILES
 
     os.chdir(BASE_DIR)
 
@@ -128,6 +129,12 @@ def startup_event():
     except Exception as e:
         APSOIL_INDEX = []
         print(f"[startup] No APSoil index loaded ({e}).")
+    try:
+        APSOIL_PROFILES = json.load(open(BASE_DIR / "apsoil_profiles.json"))
+        print(f"[startup] Loaded {len(APSOIL_PROFILES)} APSoil water profiles.")
+    except Exception as e:
+        APSOIL_PROFILES = {}
+        print(f"[startup] No APSoil profiles loaded ({e}).")
     print(f"[startup] Loaded {len(LULIST)} land uses.")
 
 
@@ -840,9 +847,26 @@ def soil_match(req: SoilMatchRequest):
             "distance_km": local_km,
         },
         "reason": reason,
+        "profile": APSOIL_PROFILES.get(str(best["apsoil"])),
         "candidates": [
             {"apsoil": s["apsoil"], "name": s["name"],
              "soiltype": s["soiltype"], "pawc_per_m": s["pawc_per_m"]}
             for s in ranked
         ],
+    }
+
+
+@app.get("/soil-profile/{apsoil}")
+def soil_profile(apsoil: int):
+    """Per-layer water profile (Thickness, AirDry, LL15, DUL, SAT, crop LLs +
+    PAWC) for one APSoil - the data behind the volumetric-water-over-depth
+    chart. Used both for the auto-selected base case and the override picker."""
+    prof = APSOIL_PROFILES.get(str(apsoil))
+    if prof is None:
+        raise HTTPException(404, f"No water profile for APSoil {apsoil}.")
+    meta = next((s for s in APSOIL_INDEX if s["apsoil"] == apsoil), None)
+    return {
+        "apsoil": apsoil,
+        "name": meta["name"] if meta else str(apsoil),
+        "profile": prof,
     }
