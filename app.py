@@ -523,6 +523,10 @@ class OptimiseRequest(BaseModel):
     parameters: Optional[Dict[str, Any]] = None
     additional_effects: Optional[List[Dict[str, Any]]] = None
     disallowed_combos: Optional[List[List[Any]]] = None
+    # Restrict the search to these land-use names (the member's farm-viable set). Shrinking
+    # the set also shrinks the combinatorial space, so a member who grows few crops often
+    # drops back under the exhaustive cap -> a clean, exact top-N. None/empty = all land uses.
+    allowed: Optional[List[str]] = None
 
 
 # Exhaustive search evaluates nlu**years rotations. Above this many combos we
@@ -604,6 +608,18 @@ def optimise(req: OptimiseRequest):
         lulist_use = LULIST
         params_use = dict(PARAMETERS)
         optional_use = OPTIONALPARAMS
+
+    # Restrict to the member's viable land uses (if supplied). Rebuild optional params
+    # against the filtered set so combo/effect indices stay aligned. Ignore the filter
+    # if it would leave nothing to search.
+    if req.allowed:
+        allow = {str(a).strip().lower() for a in req.allowed if str(a).strip()}
+        filtered = [lu for lu in lulist_use if str(lu.get("name", "")).strip().lower() in allow]
+        if filtered:
+            lulist_use = filtered
+            optional_use = _build_optionalparams(
+                lulist_use, req.additional_effects, req.disallowed_combos
+            )
 
     nlu = len(lulist_use)
     ny = req.years or int(params_use.get("nyears") or 0)
