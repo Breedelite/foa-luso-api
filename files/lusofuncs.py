@@ -89,6 +89,12 @@ class State:
             actualprice=lu['price']*choice(self.optionalparams['pricevarlist'][lui])
         else:
             actualprice=lu['price']
+        # Paired price+yield Monte-Carlo: a season may carry a per-crop price
+        # multiplier (key "<name>_price") = that historical year's detrended
+        # price / median. Applied WITH this season's yield so the year's real
+        # yield-price pairing is preserved. Absent -> 1.0 (no change; backward compatible).
+        if stochEffects!=None:
+            actualprice = actualprice * float(stochEffects.get(lu['name'] + "_price", 1.0))
         income=yieldd*actualprice
         nreq=lu['Nreq']
         if stochEffects!=None:
