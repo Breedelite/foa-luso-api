@@ -662,6 +662,11 @@ class SimulateRequest(BaseModel):
     # expands each into a per-crop season via land_uses[].beta:
     #   crop_mult = 1 + beta * (m - 1)   (weed/disease/N held neutral).
     yield_multipliers: Optional[List[float]] = None
+    # Paired price+yield: per-crop detrended price multiplier per historical year,
+    # aligned index-for-index with yield_multipliers (same years). Keyed by land-use
+    # name, e.g. {"wheat":[0.9,1.1,...], "canola":[...]}. Each season then carries its
+    # year's yield AND price together, preserving the real yield-price relationship.
+    price_multipliers: Optional[Dict[str, List[float]]] = None
 
 
 def _coerce_season(s: Dict[str, Any]) -> Dict[str, Any]:
@@ -677,9 +682,13 @@ def _coerce_season(s: Dict[str, Any]) -> Dict[str, Any]:
     return out
 
 
-def _seasons_from_multipliers(mults: List[Any], lulist: List[dict]) -> List[dict]:
+def _seasons_from_multipliers(mults: List[Any], lulist: List[dict],
+                              price_mults: Optional[Dict[str, List[float]]] = None) -> List[dict]:
     """Expand a reference (wheat) yield-multiplier series into per-crop season
-    dicts using each land use's beta. Weed/disease/N effects held neutral."""
+    dicts using each land use's beta. Weed/disease/N effects held neutral. When
+    price_mults is given, each season also carries that year's per-crop price
+    multiplier (key "<name>_price"), so yield and price stay paired by year."""
+    price_mults = price_mults or {}
     seasons: List[dict] = []
     for i, m in enumerate(mults):
         try:
@@ -697,8 +706,37 @@ def _seasons_from_multipliers(mults: List[Any], lulist: List[dict]) -> List[dict
             except (TypeError, ValueError):
                 beta = 1.0
             s[lu["name"]] = 1.0 + beta * (m - 1.0)
+            pm = price_mults.get(lu["name"])
+            if pm and i < len(pm):
+                try:
+                    s[lu["name"] + "_price"] = float(pm[i])
+                except (TypeError, ValueError):
+                    pass
         seasons.append(s)
     return seasons
+
+
+def _yield_price_correlation(yield_mults, price_mults):
+    """Pearson correlation between the reference (wheat) yield multiplier series
+    and the wheat price multiplier series, over the paired years. A read-out for
+    the member: negative = a natural hedge (poor yields tend to meet firmer prices).
+    Returns None if wheat prices weren't supplied or the series is too short."""
+    if not price_mults:
+        return None
+    wp = price_mults.get("wheat")
+    if not wp or not yield_mults:
+        return None
+    n = min(len(yield_mults), len(wp))
+    if n < 4:
+        return None
+    try:
+        y = np.array([float(x) for x in yield_mults[:n]], dtype=float)
+        p = np.array([float(x) for x in wp[:n]], dtype=float)
+    except (TypeError, ValueError):
+        return None
+    if y.std() == 0 or p.std() == 0:
+        return None
+    return float(np.corrcoef(y, p)[0, 1])
 
 
 @app.post("/simulate")
@@ -723,7 +761,7 @@ def simulate(req: SimulateRequest):
     names = names_from_indices(indices, lulist_use)
 
     if req.yield_multipliers:
-        seasons = _seasons_from_multipliers(req.yield_multipliers, lulist_use)
+        seasons = _seasons_from_multipliers(req.yield_multipliers, lulist_use, req.price_multipliers)
     elif req.seasons:
         seasons = [_coerce_season(s) for s in req.seasons]
     else:
@@ -754,10 +792,15 @@ def simulate(req: SimulateRequest):
     std = float(arr.std())
     mean = float(arr.mean())
 
+    price_varied = bool(req.price_multipliers)
+    yp_corr = _yield_price_correlation(req.yield_multipliers, req.price_multipliers) if price_varied else None
+
     return {
         "rotation_label": req.rotation.label or "-".join(names),
         "sequence_names": names,
         "season_types": nseason,
+        "price_varied": price_varied,
+        "yield_price_correlation": yp_corr,
         "distribution": {
             "reps": reps,
             "years": ny,
