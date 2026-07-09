@@ -667,6 +667,63 @@ class SimulateRequest(BaseModel):
     # name, e.g. {"wheat":[0.9,1.1,...], "canola":[...]}. Each season then carries its
     # year's yield AND price together, preserving the real yield-price relationship.
     price_multipliers: Optional[Dict[str, List[float]]] = None
+    # Preferred paired mode: raw series, API does the year-alignment. FileMaker passes
+    # the member's yield BY YEAR (FrostHeatYield) and the prices block (each crop's
+    # decile-5 "price" + full "annual" {year: price}). The API intersects years,
+    # builds yield_multipliers + per-crop price_multipliers over the common years.
+    yield_by_year: Optional[Dict[str, float]] = None
+    prices: Optional[Dict[str, Any]] = None
+
+
+def _paired_from_series(yield_by_year: Dict[str, float], prices: Optional[Dict[str, Any]]):
+    """From the member's FrostHeatYield-by-year and the prices block, build the paired
+    yield_multipliers (list over common years) + per-crop price_multipliers. Season pool =
+    the yield years intersected with wheat's price years (the reference), so wheat is always
+    fully paired; other crops vary where their history covers the year, else sit at median
+    (multiplier 1.0). Returns (years, yield_multipliers, price_multipliers)."""
+    prices = prices or {}
+    yby = {}
+    for y, v in yield_by_year.items():
+        try:
+            yby[int(y)] = float(v)
+        except (TypeError, ValueError):
+            continue
+    if not yby:
+        return [], [], {}
+    wheat_yrs = set()
+    wa = (prices.get("wheat") or {}).get("annual") or {}
+    for y in wa:
+        try:
+            wheat_yrs.add(int(y))
+        except (TypeError, ValueError):
+            pass
+    pool = sorted(y for y in yby if (not wheat_yrs or y in wheat_yrs))
+    if len(pool) < 4:            # too little overlap -> fall back to all yield years
+        pool = sorted(yby)
+    ymean = sum(yby[y] for y in pool) / len(pool)
+    if ymean <= 0:
+        return [], [], {}
+    yield_multipliers = [yby[y] / ymean for y in pool]
+    price_multipliers: Dict[str, List[float]] = {}
+    for crop, pd in prices.items():
+        if not isinstance(pd, dict):
+            continue
+        try:
+            med = float(pd.get("price"))
+        except (TypeError, ValueError):
+            continue
+        if med <= 0:
+            continue
+        annual = pd.get("annual") or {}
+        row = []
+        for y in pool:
+            a = annual.get(str(y))
+            try:
+                row.append(float(a) / med if a is not None else 1.0)
+            except (TypeError, ValueError):
+                row.append(1.0)
+        price_multipliers[crop] = row
+    return pool, yield_multipliers, price_multipliers
 
 
 def _coerce_season(s: Dict[str, Any]) -> Dict[str, Any]:
@@ -760,8 +817,13 @@ def simulate(req: SimulateRequest):
     indices = indices_from_rotation(req.rotation, lulist_use)
     names = names_from_indices(indices, lulist_use)
 
-    if req.yield_multipliers:
-        seasons = _seasons_from_multipliers(req.yield_multipliers, lulist_use, req.price_multipliers)
+    ym_used, pm_used = None, None
+    if req.yield_by_year:
+        _pool, ym_used, pm_used = _paired_from_series(req.yield_by_year, req.prices)
+        seasons = _seasons_from_multipliers(ym_used, lulist_use, pm_used)
+    elif req.yield_multipliers:
+        ym_used, pm_used = req.yield_multipliers, req.price_multipliers
+        seasons = _seasons_from_multipliers(ym_used, lulist_use, pm_used)
     elif req.seasons:
         seasons = [_coerce_season(s) for s in req.seasons]
     else:
@@ -792,8 +854,8 @@ def simulate(req: SimulateRequest):
     std = float(arr.std())
     mean = float(arr.mean())
 
-    price_varied = bool(req.price_multipliers)
-    yp_corr = _yield_price_correlation(req.yield_multipliers, req.price_multipliers) if price_varied else None
+    price_varied = bool(pm_used)
+    yp_corr = _yield_price_correlation(ym_used, pm_used) if price_varied else None
 
     return {
         "rotation_label": req.rotation.label or "-".join(names),
