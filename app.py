@@ -773,6 +773,22 @@ def _seasons_from_multipliers(mults: List[Any], lulist: List[dict],
     return seasons
 
 
+def _grid_season(ymult: float, pmult: float, lulist: List[dict]) -> Dict[str, Any]:
+    """One deterministic 'season' for the sensitivity grid: every crop's yield sits at
+    `ymult` (expanded by beta) and every crop's price at `pmult`. Weed/disease/N neutral,
+    so the rotation's agronomy still plays out over the sequence, just at this price/yield."""
+    s: Dict[str, Any] = {"label": "grid", "IEseason": 1.0, "DEseason": 1.0,
+                         "weedSeed": 1.0, "weedComp": 1.0, "NReq": 1.0, "Nlost": 0.0}
+    for lu in lulist:
+        try:
+            beta = float(lu.get("beta") or 1.0)
+        except (TypeError, ValueError):
+            beta = 1.0
+        s[lu["name"]] = 1.0 + beta * (ymult - 1.0)
+        s[lu["name"] + "_price"] = pmult
+    return s
+
+
 def _yield_price_correlation(yield_mults, price_mults):
     """Pearson correlation between the reference (wheat) yield multiplier series
     and the wheat price multiplier series, over the paired years. A read-out for
@@ -857,12 +873,42 @@ def simulate(req: SimulateRequest):
     price_varied = bool(pm_used)
     yp_corr = _yield_price_correlation(ym_used, pm_used) if price_varied else None
 
+    # --- Sensitivity grid: net profit across price x yield, at the current cost base ---
+    # Deterministic evaluation of the rotation at each (price, yield) percentile combo, so
+    # the member sees the whole profit surface and where they cross into loss. Uses the
+    # actual yield (AgriYield) and price (market) distributions for the axis levels.
+    sensitivity = None
+    if ym_used and price_varied and pm_used.get("wheat"):
+        pcts = [10, 30, 50, 70, 90]
+        y_mults = [float(x) for x in np.percentile(np.array(ym_used, dtype=float), pcts)]
+        p_mults = [float(x) for x in np.percentile(np.array(pm_used["wheat"], dtype=float), pcts)]
+        wheat_lu = next((lu for lu in lulist_use if lu.get("name") == "wheat"), None)
+        base_yield = float(wheat_lu.get("yield") or 0) if wheat_lu else 0.0
+        base_price = float(wheat_lu.get("price") or 0) if wheat_lu else 0.0
+        matrix = []
+        for pm in p_mults:                    # rows = price (low -> high)
+            row = []
+            for ym in y_mults:                # cols = yield (poor -> good)
+                season = _grid_season(ym, pm, lulist_use)
+                pr = profit(indices, params_use, lulist_use,
+                            optionalparams=optional_use, stochMultsUsed=[season] * ny)
+                row.append(round(float(_normalise_value(pr)) / ny, 0))
+            matrix.append(row)
+        sensitivity = {
+            "price_pctiles": pcts, "yield_pctiles": pcts,
+            "price_axis": [round(base_price * m) for m in p_mults],   # wheat $/t at each price percentile
+            "yield_axis": [round(base_yield * m, 2) for m in y_mults], # wheat t/ha at each yield percentile
+            "profit": matrix, "base_price_index": 2, "base_yield_index": 2,
+            "units": "net $/ha/yr",
+        }
+
     return {
         "rotation_label": req.rotation.label or "-".join(names),
         "sequence_names": names,
         "season_types": nseason,
         "price_varied": price_varied,
         "yield_price_correlation": yp_corr,
+        "sensitivity": sensitivity,
         "distribution": {
             "reps": reps,
             "years": ny,
