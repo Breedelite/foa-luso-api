@@ -542,17 +542,24 @@ def _heuristic_search(ny, nlu, nsols, params, lulist, optionalparams,
     comparable, and total work is bounded regardless of rotation length."""
     rng = random.Random(12345)
 
+    # Record EVERY rotation evaluated during the search (not just each restart's final
+    # optimum) so the top-N ranked list stays populated even when many restarts converge
+    # to the same dominant rotation. The coordinate ascent already evaluates a rich
+    # neighbourhood of near-optimal rotations, so its best-N is a sound ranked list.
+    results = {}  # tuple(lus) -> profit
+
     def pf(lus):
-        return float(_normalise_value(
+        val = float(_normalise_value(
             profit(lus, params, lulist, optionalparams=optionalparams)
         ))
+        results[tuple(lus)] = val
+        return val
 
     # Bound total work: each restart costs up to max_sweeps*ny*(nlu-1) evals,
     # so longer rotations simply get fewer restarts (wall time stays ~constant).
     per_restart = max(1, max_sweeps * ny * max(1, nlu - 1))
     restarts = max(8, min(40, eval_budget // per_restart))
 
-    results = {}  # tuple(lus) -> profit
     for r in range(restarts):
         # First restart = single-land-use baseline; the rest are random.
         lus = [0] * ny if r == 0 else [rng.randint(0, nlu - 1) for _ in range(ny)]
@@ -574,7 +581,6 @@ def _heuristic_search(ny, nlu, nsols, params, lulist, optionalparams,
                     cur, improved = best_p, True
             if not improved:
                 break
-        results[tuple(lus)] = cur
 
     ranked = sorted(([p, list(k)] for k, p in results.items()),
                     key=lambda b: b[0], reverse=True)
