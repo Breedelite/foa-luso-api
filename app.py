@@ -695,6 +695,12 @@ class SimulateRequest(BaseModel):
     # builds yield_multipliers + per-crop price_multipliers over the common years.
     yield_by_year: Optional[Dict[str, float]] = None
     prices: Optional[Dict[str, Any]] = None
+    # Grazing phase (from render-service /grazing-simulate): per grazing land use, the member's
+    # gross margin BY CLIMATE YEAR {land_use: {year: gm_$ha}}. Aligned to the same year pool as the
+    # crop yields/prices, so each season carries that land use's grazing GM ("<name>_gm") and pasture
+    # years are valued by the member's economics (income - overhead - direct - feed), paired with the
+    # same year's crop yields/prices. The pasture phase's agronomic effects on crops are unchanged.
+    grazing_gm: Optional[Dict[str, Dict[str, float]]] = None
 
 
 def _paired_from_series(yield_by_year: Dict[str, float], prices: Optional[Dict[str, Any]]):
@@ -761,13 +767,36 @@ def _coerce_season(s: Dict[str, Any]) -> Dict[str, Any]:
     return out
 
 
+def _align_grazing_gm(grazing_gm: Optional[Dict[str, Dict[str, float]]],
+                      pool: List[int]) -> Dict[str, List[Optional[float]]]:
+    """Align the member's grazing GM {land_use: {year: gm}} to the season year pool -> a list per
+    land use, index-for-index with the seasons. Missing years -> None (season won't carry a GM for
+    that land use that year, so it falls back to the modelled economics)."""
+    out: Dict[str, List[Optional[float]]] = {}
+    for lu, by_year in (grazing_gm or {}).items():
+        row: List[Optional[float]] = []
+        for y in pool:
+            v = by_year.get(str(y), by_year.get(int(y)) if isinstance(by_year, dict) else None)
+            try:
+                row.append(float(v) if v is not None else None)
+            except (TypeError, ValueError):
+                row.append(None)
+        out[lu] = row
+    return out
+
+
 def _seasons_from_multipliers(mults: List[Any], lulist: List[dict],
-                              price_mults: Optional[Dict[str, List[float]]] = None) -> List[dict]:
+                              price_mults: Optional[Dict[str, List[float]]] = None,
+                              grazing_gm: Optional[Dict[str, List[Optional[float]]]] = None) -> List[dict]:
     """Expand a reference (wheat) yield-multiplier series into per-crop season
     dicts using each land use's beta. Weed/disease/N effects held neutral. When
     price_mults is given, each season also carries that year's per-crop price
-    multiplier (key "<name>_price"), so yield and price stay paired by year."""
+    multiplier (key "<name>_price"), so yield and price stay paired by year. When
+    grazing_gm is given, each season also carries that year's grazing gross margin
+    (key "<name>_gm") for grazing land uses, so pasture years are valued by the
+    member's economics — paired to the same year as the crop yield/price."""
     price_mults = price_mults or {}
+    grazing_gm = grazing_gm or {}
     seasons: List[dict] = []
     for i, m in enumerate(mults):
         try:
@@ -791,6 +820,9 @@ def _seasons_from_multipliers(mults: List[Any], lulist: List[dict],
                     s[lu["name"] + "_price"] = float(pm[i])
                 except (TypeError, ValueError):
                     pass
+            gm = grazing_gm.get(lu["name"])
+            if gm and i < len(gm) and gm[i] is not None:
+                s[lu["name"] + "_gm"] = gm[i]
         seasons.append(s)
     return seasons
 
@@ -857,8 +889,9 @@ def simulate(req: SimulateRequest):
 
     ym_used, pm_used = None, None
     if req.yield_by_year:
-        _pool, ym_used, pm_used = _paired_from_series(req.yield_by_year, req.prices)
-        seasons = _seasons_from_multipliers(ym_used, lulist_use, pm_used)
+        pool, ym_used, pm_used = _paired_from_series(req.yield_by_year, req.prices)
+        gm_aligned = _align_grazing_gm(req.grazing_gm, pool) if req.grazing_gm else None
+        seasons = _seasons_from_multipliers(ym_used, lulist_use, pm_used, gm_aligned)
     elif req.yield_multipliers:
         ym_used, pm_used = req.yield_multipliers, req.price_multipliers
         seasons = _seasons_from_multipliers(ym_used, lulist_use, pm_used)
