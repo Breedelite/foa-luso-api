@@ -115,6 +115,17 @@ class State:
         # existing CSV-driven land uses are unaffected.
         overhead=parameters['fixedcosts']+lu.get('overhead',0)
         undiscountedprofit=income-actualCost-Ncost-overhead
+        # Grazing phase: if the season carries a member-supplied grazing gross margin for this land
+        # use ("<name>_gm"), it IS the complete economic value of this (pasture) year (the member's
+        # income minus ALL their costs: overhead, direct, supplementary feed). Replace the modelled
+        # crop economics for the year, but keep every agronomic state update below (N boost, weed
+        # break, disease carry-over) so the pasture phase still benefits the following crops.
+        # Absent -> unchanged (backward compatible with all crop land uses).
+        if stochEffects is not None:
+            _gm = stochEffects.get(lu['name'] + "_gm")
+            if _gm is not None:
+                income = float(_gm); actualCost = 0.0; Ncost = 0.0; overhead = 0.0
+                undiscountedprofit = float(_gm)
         profit=self.discount*undiscountedprofit
         self.discount=self.discount*(1-parameters['discountrate'])
         if lu['name']=='canola':
