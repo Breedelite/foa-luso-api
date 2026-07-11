@@ -59,6 +59,10 @@ class EvaluateRequest(BaseModel):
     parameters: Optional[Dict[str, Any]] = None
     additional_effects: Optional[List[Dict[str, Any]]] = None
     disallowed_combos: Optional[List[List[Any]]] = None
+    # Grazing phase (from /grazing-simulate): {land_use: {year: gm_$ha}}. The deterministic hero
+    # values pasture years at the MEAN grazing GM (so it agrees with the risk distribution, which
+    # uses the full per-year series). Agronomic effects on following crops are unchanged.
+    grazing_gm: Optional[Dict[str, Dict[str, float]]] = None
 
 
 class RotationEconomics(BaseModel):
@@ -168,6 +172,33 @@ def indices_from_rotation(rot: RotationInput, lulist: List[dict]) -> List[int]:
 
 def names_from_indices(indices: List[int], lulist: List[dict]) -> List[str]:
     return [lulist[i]["name"] for i in indices]
+
+
+def _mean_grazing_season(grazing_gm: Optional[Dict[str, Dict[str, float]]],
+                         names: List[str]) -> Optional[Dict[str, Any]]:
+    """A single deterministic 'season' valuing each grazing land use at its MEAN grazing GM
+    (carried as '<name>_gm'); every land use gets a neutral 1.0 yield multiplier so the crop years
+    are identical to the no-season path. Used by /evaluate so the hero matches the risk mean.
+    Returns None if no grazing GM applies to any land use in the rotation."""
+    if not grazing_gm:
+        return None
+    s: Dict[str, Any] = {"label": "mean", "IEseason": 1.0, "DEseason": 1.0, "weedSeed": 1.0,
+                         "weedComp": 1.0, "NReq": 1.0, "Nlost": 0.0}
+    applied = False
+    for lu in set(names):
+        s[lu] = 1.0
+        by_year = grazing_gm.get(lu)
+        if by_year:
+            vals = []
+            for v in by_year.values():
+                try:
+                    vals.append(float(v))
+                except (TypeError, ValueError):
+                    pass
+            if vals:
+                s[lu + "_gm"] = sum(vals) / len(vals)
+                applied = True
+    return s if applied else None
 
 
 def _normalise_value(v: Any) -> Any:
@@ -461,11 +492,18 @@ def evaluate_rotation(req: EvaluateRequest) -> EvaluateResponse:
     indices = indices_from_rotation(req.rotation, lulist_use)
     names = names_from_indices(indices, lulist_use)
 
+    # Grazing phase: value pasture years at the member's MEAN grazing GM (single deterministic
+    # season repeated across the rotation), so the hero agrees with the risk distribution. None
+    # when the rotation has no grazing land use -> identical to the previous behaviour.
+    _graz_season = _mean_grazing_season(req.grazing_gm, names)
+    _eval_seq = [_graz_season] * len(indices) if _graz_season else None
+
     # ----- Headline economics (net profit; profit() now nets overhead) ----
     if req.annualise:
         profit_per_year = profit(
             indices, params_use, lulist_use,
             getDetails=False, optionalparams=optional_use, annualise=True,
+            stochMultsUsed=_eval_seq,
         )
         years = len(indices)
         profit_total = profit_per_year * years
@@ -473,6 +511,7 @@ def evaluate_rotation(req: EvaluateRequest) -> EvaluateResponse:
         profit_total = profit(
             indices, params_use, lulist_use,
             getDetails=False, optionalparams=optional_use, annualise=False,
+            stochMultsUsed=_eval_seq,
         )
         years = len(indices)
         profit_per_year = profit_total / years
@@ -481,6 +520,7 @@ def evaluate_rotation(req: EvaluateRequest) -> EvaluateResponse:
     raw = profit(
         indices, params_use, lulist_use,
         getDetails=True, optionalparams=optional_use, annualise=False,
+        stochMultsUsed=_eval_seq,
     )
 
     if not isinstance(raw, list):
