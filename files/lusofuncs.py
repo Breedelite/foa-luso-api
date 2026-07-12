@@ -274,8 +274,9 @@ def getFinalCostOfSeedbank(seedbank,parameters):
 # cereal monoculture. The penalty escalates with each extra consecutive cereal
 # (declining returns), reflecting compounding resistance/disease pressure.
 DEFAULT_CEREAL_NAMES = ['wheat','barley','oats','triticale','cereal rye','durum','durum wheat']
-DEFAULT_CONSEC_CEREAL_PENALTY = 50.0   # $/ha for the first cereal past the threshold; x2 next, x3 next...
-DEFAULT_MAX_FREE_CEREALS = 2           # up to this many consecutive cereals is free
+DEFAULT_CONSEC_CEREAL_PENALTY = 120.0     # $/ha base for the first cereal past the threshold
+DEFAULT_MAX_FREE_CEREALS = 3              # free consecutive cereals (GRDC: 3-4 cereal + canola is often optimal)
+DEFAULT_CEREAL_PENALTY_EXPONENT = 2.0     # escalation shape: 2 = quadratic (compounding); 1 = linear
 
 def getConsecutiveCerealPenalty(lus,lulist,parameters):
     try:
@@ -288,6 +289,10 @@ def getConsecutiveCerealPenalty(lus,lulist,parameters):
         maxfree = int(parameters.get('maxFreeCereals', DEFAULT_MAX_FREE_CEREALS))
     except (TypeError, ValueError):
         maxfree = DEFAULT_MAX_FREE_CEREALS
+    try:
+        exponent = float(parameters.get('cerealPenaltyExponent', DEFAULT_CEREAL_PENALTY_EXPONENT))
+    except (TypeError, ValueError):
+        exponent = DEFAULT_CEREAL_PENALTY_EXPONENT
     names = parameters.get('cerealnames', DEFAULT_CEREAL_NAMES)
     cerealset = set(str(n).strip().lower() for n in names)
     total = 0.0
@@ -297,7 +302,7 @@ def getConsecutiveCerealPenalty(lus,lulist,parameters):
         if nm in cerealset:
             run += 1
             if run > maxfree:
-                total += base * (run - maxfree)
+                total += base * (run - maxfree) ** exponent
         else:
             run = 0
     return total
