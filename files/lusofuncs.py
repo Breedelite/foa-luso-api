@@ -202,6 +202,10 @@ def profit(lus,parameters,lulist,getDetails=False,parameters2=None,lulist2=None,
     if lulist2==None: lulist2=lulist
     p=0
     lulist0=lulist
+    # Per-year cereal-monoculture penalty (nominal $/ha), attributed to the year that
+    # incurs it, and applied INSIDE the loop (discounted like that year's profit) so the
+    # year-by-year breakdown reconciles and the total stays consistent.
+    cerealPenArr=getConsecutiveCerealPenaltyByYear(lus,lulist0,parameters)
     st=State(parameters,optionalparams)
     details=[]
     yr=0
@@ -216,6 +220,16 @@ def profit(lus,parameters,lulist,getDetails=False,parameters2=None,lulist2=None,
             out=st.update(lu,lui,parameters)
         else:
             out=st.update(lu,lui,parameters,stochEffects=stochMultsUsed[yr],pureRandomEffects=pureRandomEffects)
+        # Deduct this year's cereal-monoculture penalty. Discount it by the same factor the
+        # engine applied to this year's profit (so it is a present-value cost), and also net it
+        # off the undiscounted profit so the nominal breakdown row adds up.
+        _pen=cerealPenArr[yr] if yr < len(cerealPenArr) else 0.0
+        if _pen:
+            _ud=out.get('undiscountedprofit',0.0)
+            _factor=(out['profit']/_ud) if _ud else 1.0
+            out['profit']=out['profit']-_pen*_factor
+            out['undiscountedprofit']=_ud-_pen
+        out['cerealPenalty']=_pen
         p=p+out['profit']
         out['cumprofit'] = p
         ds=ds+out['discount']
@@ -235,8 +249,7 @@ def profit(lus,parameters,lulist,getDetails=False,parameters2=None,lulist2=None,
     if optionalparams!=None:
         if optionalparams['disallowedcombos']!=[]:
             p=p-getpenaltyfordisallowedcombos(lus,optionalparams['disallowedcombos'])
-    # Soft escalating penalty for cereal monoculture (see getConsecutiveCerealPenalty).
-    p=p-getConsecutiveCerealPenalty(lus,lulist0,parameters)
+    # (Cereal-monoculture penalty is now applied per-year inside the loop above.)
     #if out['newseedbank']>parameters['seedbank0']:
         #p=p-(out['newseedbank']-parameters['seedbank0'])*parameters['costperweedseed']
     if annualise:
@@ -278,13 +291,17 @@ DEFAULT_CONSEC_CEREAL_PENALTY = 120.0     # $/ha base for the first cereal past 
 DEFAULT_MAX_FREE_CEREALS = 3              # free consecutive cereals (GRDC: 3-4 cereal + canola is often optimal)
 DEFAULT_CEREAL_PENALTY_EXPONENT = 2.0     # escalation shape: 2 = quadratic (compounding); 1 = linear
 
-def getConsecutiveCerealPenalty(lus,lulist,parameters):
+def getConsecutiveCerealPenaltyByYear(lus,lulist,parameters):
+    """Per-year (nominal $/ha) cereal-monoculture penalty, aligned to `lus`.
+    0 for the first `maxFreeCereals` consecutive cereals; then base * (run-maxfree)**exponent."""
+    n = len(lus)
+    out = [0.0] * n
     try:
         base = float(parameters.get('consecutiveCerealPenalty', DEFAULT_CONSEC_CEREAL_PENALTY))
     except (TypeError, ValueError):
         base = DEFAULT_CONSEC_CEREAL_PENALTY
     if base <= 0:
-        return 0.0
+        return out
     try:
         maxfree = int(parameters.get('maxFreeCereals', DEFAULT_MAX_FREE_CEREALS))
     except (TypeError, ValueError):
@@ -294,18 +311,20 @@ def getConsecutiveCerealPenalty(lus,lulist,parameters):
     except (TypeError, ValueError):
         exponent = DEFAULT_CEREAL_PENALTY_EXPONENT
     names = parameters.get('cerealnames', DEFAULT_CEREAL_NAMES)
-    cerealset = set(str(n).strip().lower() for n in names)
-    total = 0.0
+    cerealset = set(str(x).strip().lower() for x in names)
     run = 0
-    for lui in lus:
-        nm = str(lulist[lui].get('name','')).strip().lower()
+    for k in range(n):
+        nm = str(lulist[lus[k]].get('name','')).strip().lower()
         if nm in cerealset:
             run += 1
             if run > maxfree:
-                total += base * (run - maxfree) ** exponent
+                out[k] = base * (run - maxfree) ** exponent
         else:
             run = 0
-    return total
+    return out
+
+def getConsecutiveCerealPenalty(lus,lulist,parameters):
+    return sum(getConsecutiveCerealPenaltyByYear(lus,lulist,parameters))
 
 ### extract total profit from details (from function above)
 def getProfitfromDetails(details):
