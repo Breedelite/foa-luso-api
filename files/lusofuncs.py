@@ -201,6 +201,7 @@ def profit(lus,parameters,lulist,getDetails=False,parameters2=None,lulist2=None,
     if parameters2==None: parameters2=parameters
     if lulist2==None: lulist2=lulist
     p=0
+    lulist0=lulist
     st=State(parameters,optionalparams)
     details=[]
     yr=0
@@ -234,6 +235,8 @@ def profit(lus,parameters,lulist,getDetails=False,parameters2=None,lulist2=None,
     if optionalparams!=None:
         if optionalparams['disallowedcombos']!=[]:
             p=p-getpenaltyfordisallowedcombos(lus,optionalparams['disallowedcombos'])
+    # Soft escalating penalty for cereal monoculture (see getConsecutiveCerealPenalty).
+    p=p-getConsecutiveCerealPenalty(lus,lulist0,parameters)
     #if out['newseedbank']>parameters['seedbank0']:
         #p=p-(out['newseedbank']-parameters['seedbank0'])*parameters['costperweedseed']
     if annualise:
@@ -261,6 +264,43 @@ def getpenaltyfordisallowedcombos(lus,disallowedcombos):
 
 def getFinalCostOfSeedbank(seedbank,parameters):
     return seedbank*parameters['costperweedseed']
+
+# --- Continuous-cereal (monoculture) penalty ------------------------------
+# Soft, escalating $/ha penalty for running more than `maxFreeCereals` cereals
+# in a row. Grounded in Australian grains research (GRDC): over-reliance on
+# cereal-dominated sequences drives herbicide-resistant grass weeds and builds
+# stubble-borne cereal disease (e.g. barley net blotch) - costs the base LUSO
+# model does not otherwise represent, so the optimiser would happily return a
+# cereal monoculture. The penalty escalates with each extra consecutive cereal
+# (declining returns), reflecting compounding resistance/disease pressure.
+DEFAULT_CEREAL_NAMES = ['wheat','barley','oats','triticale','cereal rye','durum','durum wheat']
+DEFAULT_CONSEC_CEREAL_PENALTY = 50.0   # $/ha for the first cereal past the threshold; x2 next, x3 next...
+DEFAULT_MAX_FREE_CEREALS = 2           # up to this many consecutive cereals is free
+
+def getConsecutiveCerealPenalty(lus,lulist,parameters):
+    try:
+        base = float(parameters.get('consecutiveCerealPenalty', DEFAULT_CONSEC_CEREAL_PENALTY))
+    except (TypeError, ValueError):
+        base = DEFAULT_CONSEC_CEREAL_PENALTY
+    if base <= 0:
+        return 0.0
+    try:
+        maxfree = int(parameters.get('maxFreeCereals', DEFAULT_MAX_FREE_CEREALS))
+    except (TypeError, ValueError):
+        maxfree = DEFAULT_MAX_FREE_CEREALS
+    names = parameters.get('cerealnames', DEFAULT_CEREAL_NAMES)
+    cerealset = set(str(n).strip().lower() for n in names)
+    total = 0.0
+    run = 0
+    for lui in lus:
+        nm = str(lulist[lui].get('name','')).strip().lower()
+        if nm in cerealset:
+            run += 1
+            if run > maxfree:
+                total += base * (run - maxfree)
+        else:
+            run = 0
+    return total
 
 ### extract total profit from details (from function above)
 def getProfitfromDetails(details):
