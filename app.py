@@ -232,10 +232,12 @@ _PARAM_DEFAULTS: Dict[str, float] = {
     "IEprevinc": 0.0, "IErandom": 0.0, "DEinc": 0.0, "DErandom": 0.0,
     "costperweedseed": 0.0,
     # Soft escalating cereal-monoculture penalty (see lusofuncs.getConsecutiveCerealPenalty).
-    # $/ha for the first cereal past `maxFreeCereals` consecutive, escalating linearly.
+    # $/ha base for the first cereal past `maxFreeCereals` consecutive, escalating by
+    # (run - maxFreeCereals) ** cerealPenaltyExponent (2 = quadratic/compounding).
     # Tune here (or override per-request via parameters); set the penalty to 0 to disable.
-    "consecutiveCerealPenalty": 50.0,
-    "maxFreeCereals": 2.0,
+    "consecutiveCerealPenalty": 120.0,
+    "maxFreeCereals": 3.0,
+    "cerealPenaltyExponent": 2.0,
 }
 
 
