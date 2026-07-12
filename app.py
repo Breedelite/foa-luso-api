@@ -31,7 +31,7 @@ if not inputs_dir.exists():
 sys.path.append(str(files_dir))
 
 from readers import readinLUlist, readinparams, readoptionalparams, readinstochMults  # type: ignore
-from lusofuncs import profit, convertLUnameToLUI, testallMultiSols  # type: ignore
+from lusofuncs import profit, convertLUnameToLUI, testallMultiSols, getConsecutiveCerealPenalty  # type: ignore
 
 
 # --------------------------------------------------------------------
@@ -69,6 +69,9 @@ class RotationEconomics(BaseModel):
     years: int
     profit_total: float
     profit_per_year: float
+    # Total $/ha deducted over the rotation for cereal monoculture (0 if <= maxFreeCereals
+    # consecutive cereals). Informational — it is ALREADY reflected in profit_total/_per_year.
+    consecutive_cereal_penalty: float = 0.0
 
 
 class EvaluateResponse(BaseModel):
@@ -228,6 +231,11 @@ _PARAM_DEFAULTS: Dict[str, float] = {
     "weedgermination": 0.0, "weedcompindex": 0.0, "weedmaxseedset": 0.0,
     "IEprevinc": 0.0, "IErandom": 0.0, "DEinc": 0.0, "DErandom": 0.0,
     "costperweedseed": 0.0,
+    # Soft escalating cereal-monoculture penalty (see lusofuncs.getConsecutiveCerealPenalty).
+    # $/ha for the first cereal past `maxFreeCereals` consecutive, escalating linearly.
+    # Tune here (or override per-request via parameters); set the penalty to 0 to disable.
+    "consecutiveCerealPenalty": 50.0,
+    "maxFreeCereals": 2.0,
 }
 
 
@@ -537,10 +545,16 @@ def evaluate_rotation(req: EvaluateRequest) -> EvaluateResponse:
 
     label = req.rotation.label or "-".join(names)
 
+    try:
+        cereal_penalty = float(getConsecutiveCerealPenalty(indices, lulist_use, params_use))
+    except Exception:
+        cereal_penalty = 0.0
+
     econ = RotationEconomics(
         years=years,
         profit_total=float(profit_total),
         profit_per_year=float(profit_per_year),
+        consecutive_cereal_penalty=cereal_penalty,
     )
 
     return EvaluateResponse(
