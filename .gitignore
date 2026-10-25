@@ -1,0 +1,21 @@
+# Secrets - never commit. Example files hold placeholders only.
+.env
+.env.*
+!*.env.example
+*.pem
+*.key
+*.p12
+credentials*.json
+service-account*.json
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+
+# OS / editor
+.DS_Store
+*.bak
+*.bak-*
